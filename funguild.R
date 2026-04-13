@@ -11,8 +11,15 @@ assign_funguild_to_phyloseq <- function(
       "confidence_fg"
     ),
     trait_cols = c(
-      "guild_fg", "guild_source", "trophic_mode_fg",
-      "notes_fg", "source_funguild_fg", "culture_media"
+      "guild_fg",
+      "guild_source",
+      "trophic_mode_fg",
+      "notes_fg",
+      "source_funguild_fg",
+      "culture_media",
+      "speciesMatched",
+      "confidence_fg",
+      "n_trait_rows_genus"
     ),
     mutualist_pattern  = "Ectomycorrhizal",
     saprotroph_pattern = "[S,s]aprotroph",
@@ -21,7 +28,7 @@ assign_funguild_to_phyloseq <- function(
     return_debug = FALSE
 ) {
   
-  # ---- packages (fail fast with clear messages) ----
+  # ---- packages ----
   req_pkgs <- c("phyloseq","dplyr","stringr","tibble","fungaltraits","microbiome")
   missing <- req_pkgs[!vapply(req_pkgs, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing)) {
@@ -34,7 +41,7 @@ assign_funguild_to_phyloseq <- function(
   
   fung <- ps
   
-  # pull genus/species from ORIGINAL tax table (assumes Genus=col 6, Species=col 7)
+  # pull genus/species from origional tax table (assumes Genus=col 6, Species=col 7)
   genera  <- fung@tax_table[, 6] %>% stringr::str_remove("^g__")
   species <- fung@tax_table[, 7] %>% stringr::str_remove("^s__")
   
@@ -82,7 +89,7 @@ assign_funguild_to_phyloseq <- function(
   traits_by_species <- fungal_traits_sp %>%
     dplyr::group_by(species, genus) %>%
     dplyr::summarise(
-      n_trait_rows = dplyr::n(),
+      n_trait_rows_species = dplyr::n(),
       dplyr::across(dplyr::where(is.numeric), ~ mean(.x, na.rm = TRUE)),
       dplyr::across(dplyr::where(is.character), collapse_chars),
       .groups = "drop"
@@ -91,7 +98,7 @@ assign_funguild_to_phyloseq <- function(
   traits_just_genus <- fungal_traits_genus %>%
     dplyr::group_by(Genus_key) %>%
     dplyr::summarise(
-      n_trait_rows = dplyr::n(),
+      n_trait_rows_genus = dplyr::n(),
       dplyr::across(dplyr::where(is.numeric), ~ mean(.x, na.rm = TRUE)),
       dplyr::across(dplyr::where(is.character), collapse_chars),
       .groups = "drop"
@@ -103,7 +110,7 @@ assign_funguild_to_phyloseq <- function(
   
   traits_one <- traits_by_species %>%
     dplyr::left_join(
-      traits_just_genus %>% dplyr::select(Genus_key, n_trait_rows, dplyr::all_of(cols)),
+      traits_just_genus %>% dplyr::select(Genus_key, n_trait_rows_genus, dplyr::all_of(cols)),
       by = c("genus" = "Genus_key"),
       suffix = c("", ".genus")
     ) %>%
@@ -128,7 +135,8 @@ assign_funguild_to_phyloseq <- function(
   # ---- finalize traits df ----
   traits_df <- traits_one %>%
     dplyr::select(-dplyr::ends_with(".genus")) %>%
-    dplyr::select(species, genus, guild_source, n_trait_rows, dplyr::all_of(traits_to_coalesce))
+    dplyr::select(species, genus, guild_source, n_trait_rows_species, n_trait_rows_genus,
+                  dplyr::all_of(traits_to_coalesce))
   
   # ---- append traits to tax_table ----
   tt <- phyloseq::tax_table(fung) %>%
@@ -164,91 +172,13 @@ assign_funguild_to_phyloseq <- function(
   fung_traits <- fung
   phyloseq::tax_table(fung_traits) <- phyloseq::tax_table(as.matrix(tt2))
   
-  # ---- guild vector from tax_table (named by taxa) ----
-  tt_mat <- as(phyloseq::tax_table(fung_traits), "matrix")
-  if ("guild_fg" %in% colnames(tt_mat)) {
-    guild_col <- tt_mat[, "guild_fg"]
-  } else {
-    guild_col <- tt_mat[, 8]  # fallback (your original assumption)
-  }
-  guild_col <- as.character(guild_col)
-  
-  guild_by_taxon <- stats::setNames(guild_col, phyloseq::taxa_names(fung_traits))
-  
-  # ---- define which guild strings count ----
-  mutualist_guilds <- grep(mutualist_pattern, guild_col, value = TRUE) %>% unique()
-  
-  saprotroph_guilds <-
-    grep(saprotroph_pattern, guild_col, value = TRUE) %>%
-    grep(pattern = exclude_pattern, x = ., value = TRUE, invert = TRUE) %>%
-    unique()
-  
-  pathogen_guilds <-
-    grep(pathogen_pattern, guild_col, value = TRUE) %>%
-    grep(pattern = exclude_pattern, x = ., value = TRUE, invert = TRUE) %>%
-    unique()
-  
-  # ---- counts -> proportions (NO relative abundance transform needed) ----
-  lib_sizes <- phyloseq::sample_sums(fung)
-  
-  guild_props <- function(ps_counts, guild_by_taxon_named, guild_string_set) {
-    tn <- phyloseq::taxa_names(ps_counts)
-    this_guild <- guild_by_taxon_named[tn]  # align to this phyloseq's taxa order
-    keep_taxa <- tn[!is.na(this_guild) & (this_guild %in% guild_string_set)]
-    
-    # if no taxa match, proportions are 0 for every sample
-    if (length(keep_taxa) == 0) {
-      out <- rep(0, phyloseq::nsamples(ps_counts))
-      names(out) <- phyloseq::sample_names(ps_counts)
-      return(out)
-    }
-    
-    counts <- phyloseq::sample_sums(phyloseq::prune_taxa(keep_taxa, ps_counts))
-    props  <- counts / phyloseq::sample_sums(ps_counts)
-    
-    # ensure alignment by sample name
-    props <- props[phyloseq::sample_names(ps_counts)]
-    props[is.na(props)] <- 0
-    props
-  }
-  
-  mutualist_proportions  <- guild_props(fung, guild_by_taxon, mutualist_guilds)
-  saprotroph_proportions <- guild_props(fung, guild_by_taxon, saprotroph_guilds)
-  pathogen_proportions   <- guild_props(fung, guild_by_taxon, pathogen_guilds)
-  
-  # ---- build guild_df ----
-  mutualism_df <-
-    microbiome::meta(fung_traits) %>%
-    dplyr::mutate(proportion_mutualist = mutualist_proportions)
-  
-  saprotroph_df <-
-    microbiome::meta(fung_traits) %>%
-    dplyr::mutate(proportion_saprotroph = saprotroph_proportions)
-  
-  pathogen_df <-
-    microbiome::meta(fung_traits) %>%
-    dplyr::mutate(proportion_pathogen = pathogen_proportions)
-  
-  # keep your join style; make it robust by joining on shared columns
-  guild_df <-
-    mutualism_df %>%
-    dplyr::full_join(saprotroph_df, by = intersect(names(mutualism_df), names(saprotroph_df))) %>%
-    dplyr::full_join(pathogen_df,  by = intersect(names(mutualism_df), names(pathogen_df)))
-  
-  out <- list(
-    ps_traits = fung_traits,
-    guild_df  = guild_df,
-    guild_sets = list(
-      mutualist_guilds  = mutualist_guilds,
-      saprotroph_guilds = saprotroph_guilds,
-      pathogen_guilds   = pathogen_guilds
-    )
-  )
-  
-  if (return_debug) {
-    out$traits_df  <- traits_df
-    out$tax_traits <- tax_traits
-  }
-  
-  return(out)
+  return(fung_traits)
 }
+
+a <- readRDS("test_data/fung_clean_physeq.RDS")
+
+b <- assign_funguild_to_phyloseq(a)
+
+c <- data.frame(tax_table(b))
+
+                
